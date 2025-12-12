@@ -487,3 +487,137 @@ async def test_streamable_http_mcp_client_with_500_error():
 
     assert result["status"] == "error"
     assert result["content"][0]["text"] == "Tool execution failed: Connection to the MCP server was closed"
+
+
+def start_5xx_proxy_for_first_tool_call_only(target_url: str, proxy_port: int):
+    """Starts a proxy that throws a 5XX only on the FIRST tool call, then proxies normally.
+
+    This simulates the race condition scenario where:
+    1. First tool call fails with 5xx -> background thread dies
+    2. Second tool call arrives while thread is dead but validation hasn't caught it yet -> hangs
+    """
+    import aiohttp
+    from aiohttp import web
+
+    call_count = {"count": 0}
+
+    async def proxy_handler(request):
+        url = f"{target_url}{request.path_qs}"
+
+        async with aiohttp.ClientSession() as session:
+            data = await request.read()
+
+            # Only fail the FIRST tool call with 5xx
+            if "tools/call" in f"{data}":
+                call_count["count"] += 1
+                if call_count["count"] == 1:
+                    print(f"Returning 500 for first tool call")
+                    return web.Response(status=500, text="Internal Server Error")
+                else:
+                    print(f"Proxying subsequent tool call #{call_count['count']}")
+
+            async with session.request(
+                method=request.method, url=url, headers=request.headers, data=data, allow_redirects=False
+            ) as resp:
+                response = web.StreamResponse(status=resp.status, headers=resp.headers)
+                await response.prepare(request)
+
+                async for chunk in resp.content.iter_chunked(8192):
+                    await response.write(chunk)
+
+                return response
+
+    app = web.Application()
+    app.router.add_route("*", "/{path:.*}", proxy_handler)
+
+    web.run_app(app, host="127.0.0.1", port=proxy_port)
+
+
+@pytest.mark.skipif(
+    condition=os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="streamable transport is failing in GitHub actions, debugging if linux compatibility issue",
+)
+@pytest.mark.asyncio
+async def test_race_condition_after_http_error_kills_background_thread():
+    """Test that reproduces the race condition where a tool call hangs after HTTP error kills background thread.
+
+    Scenario:
+    1. Multiple parallel tool calls are initiated
+    2. First tool call gets 5xx error -> background thread exits and sets _close_exception
+    3. Second tool call arrives AFTER thread has exited but BEFORE stop() resets state variables
+    4. Second call passes validation (session/event_loop still set) but hangs because event loop is dead
+
+    This test should FAIL (hang indefinitely) before the fix is applied.
+    """
+    import asyncio
+    import multiprocessing
+
+    server_thread = threading.Thread(
+        target=start_comprehensive_mcp_server, kwargs={"transport": "streamable-http", "port": 8003}, daemon=True
+    )
+    server_thread.start()
+
+    proxy_process = multiprocessing.Process(
+        target=start_5xx_proxy_for_first_tool_call_only,
+        kwargs={"target_url": "http://127.0.0.1:8003", "proxy_port": 8004},
+    )
+    proxy_process.start()
+
+    try:
+        await asyncio.sleep(2)  # wait for server to startup completely
+
+        def transport_callback() -> MCPTransport:
+            return streamablehttp_client(url="http://127.0.0.1:8004/mcp")
+
+        streamable_http_client = MCPClient(transport_callback)
+
+        # The race condition occurs when we try to make a second call after the first one
+        # has killed the background thread but before stop() has been called
+        with pytest.raises(RuntimeError, match="Connection to the MCP server was closed"):
+            with streamable_http_client:
+                # Make first call that will fail with 5xx and kill the background thread
+                first_call_task = asyncio.create_task(
+                    streamable_http_client.call_tool_async(
+                        tool_use_id="first", name="calculator", arguments={"x": 1, "y": 2}
+                    )
+                )
+
+                # Give first call time to fail and kill the thread
+                await asyncio.sleep(0.5)
+
+                # Now try second call - this exposes the race condition:
+                # - Background thread is dead (from first call's 5xx error)
+                # - But _background_thread_session and _background_thread_event_loop are still set
+                # - So validation in _invoke_on_background_thread passes
+                # - But asyncio.run_coroutine_threadsafe is called on a dead event loop
+                # - The future never completes -> HANGS INDEFINITELY
+
+                # This call should either fail gracefully OR succeed, but it should NOT hang
+                # We use asyncio.wait_for with a short timeout to detect the hang
+                try:
+                    second_call_task = asyncio.create_task(
+                        streamable_http_client.call_tool_async(
+                            tool_use_id="second", name="calculator", arguments={"x": 3, "y": 4}
+                        )
+                    )
+
+                    # If there's a race condition bug, this will timeout because second call hangs
+                    result = await asyncio.wait_for(second_call_task, timeout=3.0)
+
+                    # If we got here without timeout, either:
+                    # 1. The bug is fixed (call failed gracefully with proper error)
+                    # 2. The call somehow succeeded (unlikely given background thread is dead)
+                    pytest.fail(
+                        "Expected either timeout (bug present) or RuntimeError (bug fixed), "
+                        f"but got result: {result}"
+                    )
+                except asyncio.TimeoutError:
+                    # This is the bug! The second call hangs indefinitely
+                    pytest.fail(
+                        "RACE CONDITION DETECTED: Second tool call hung after background thread died. "
+                        "The call passed validation but was submitted to a dead event loop."
+                    )
+
+    finally:
+        proxy_process.terminate()
+        proxy_process.join()
