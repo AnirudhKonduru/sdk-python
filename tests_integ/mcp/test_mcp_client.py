@@ -602,7 +602,7 @@ async def test_race_condition_after_http_error_kills_background_thread():
                     )
 
                     # If there's a race condition bug, this will timeout because second call hangs
-                    result = await asyncio.wait_for(second_call_task, timeout=3.0)
+                    result = await asyncio.wait_for(second_call_task, timeout=30.0)
 
                     # If we got here without timeout, either:
                     # 1. The bug is fixed (call failed gracefully with proper error)

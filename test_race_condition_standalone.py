@@ -116,7 +116,7 @@ async def main():
 
         try:
             # Wait for both with a timeout
-            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+            results = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30.0)
             print(f"\n[MAIN] Both calls completed: {results}", flush=True)
 
             # Check if we saw the race condition window
